@@ -1,0 +1,6 @@
+requests>=2.31.0
+yfinance>=0.2.38
+pandas>=2.1.0
+numpy>=1.26.0
+rich>=13.7.0
+lxml>=5.0.0
