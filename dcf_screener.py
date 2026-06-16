@@ -40,6 +40,10 @@ TAX_RATE = 0.21             # US corporate tax rate
 MARKET_TICKER = "SPY"       # Beta benchmark
 PROJECTION_YEARS = 5
 TERMINAL_GROWTH_DEFAULT = 0.025
+# ASC 842 (effective 2019) requires operating leases on-balance-sheet.
+# They represent fixed payment obligations ranking pari-passu with debt
+# in a distress scenario, so we include them in net debt by default.
+INCLUDE_LEASE_LIABILITIES = True
 
 DAMODARAN_BETAS_URL = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/Betas.html"
 
@@ -405,16 +409,65 @@ def get_yahoo_info(ticker: str) -> dict:
                 "name": ticker, "sector": "N/A", "industry": "N/A"}
 
 
-def get_debt_interest(facts: dict) -> tuple[float, float]:
-    debt = extract_annual_values(facts, "LongTermDebt")
-    if debt.empty:
-        debt = extract_annual_values(facts, "LongTermDebtNoncurrent")
-    total_debt = float(debt.iloc[-1]) if not debt.empty else 0.0
+def get_debt_interest(facts: dict, include_leases: bool = INCLUDE_LEASE_LIABILITIES) -> dict:
+    # Returns a dict instead of a bare tuple so callers can inspect the breakdown.
+    #
+    # Why each tag is included:
+    #
+    #   LongTermDebtNoncurrent  — bonds, term loans due after 12 months
+    #   LongTermDebtCurrent     — current maturities of long-term debt (due within 12 months).
+    #                             Only added when we have the split form; adding it alongside the
+    #                             aggregate LongTermDebt tag would double-count current maturities.
+    #   LongTermDebt            — fallback aggregate tag used by filers who don't split current /
+    #                             non-current portions; mutually exclusive with the two above.
+    #   ShortTermBorrowings     — revolvers, commercial paper, short-term notes payable; never
+    #                             captured by any LongTermDebt tag, so always safe to add.
+    #   OperatingLeaseLiability — ASC 842 (FY2019+) moved operating leases onto the balance
+    #   Noncurrent / Current      sheet as right-of-use liabilities.  They rank alongside debt
+    #                             in distress, so excluding them understates financial leverage.
 
+    breakdown: dict[str, float] = {}
+
+    def _pull(tag: str) -> tuple[float, bool]:
+        """Return (latest_value, found). found is True even when value == 0."""
+        s = extract_annual_values(facts, tag)
+        if not s.empty:
+            val = float(abs(s.iloc[-1]))
+            breakdown[tag] = val
+            return val, True
+        return 0.0, False
+
+    # ── Long-term debt ──────────────────────────────────────────────────────────
+    ltd_noncurrent, got_noncurrent = _pull("LongTermDebtNoncurrent")
+    if got_noncurrent:
+        # We have the split form: safe to also pull current maturities separately.
+        ltd_current, _ = _pull("LongTermDebtCurrent")
+    else:
+        # Fallback to the aggregate tag; current maturities are already inside it.
+        ltd_noncurrent, _ = _pull("LongTermDebt")
+        ltd_current = 0.0
+
+    # ── Short-term borrowings ───────────────────────────────────────────────────
+    stb, _ = _pull("ShortTermBorrowings")
+
+    # ── Operating lease liabilities (ASC 842) ──────────────────────────────────
+    lease_total = 0.0
+    if include_leases:
+        for tag in ("OperatingLeaseLiabilityNoncurrent", "OperatingLeaseLiabilityCurrent"):
+            val, _ = _pull(tag)
+            lease_total += val
+
+    total_debt = ltd_noncurrent + ltd_current + stb + lease_total
+
+    # ── Interest expense ────────────────────────────────────────────────────────
     interest = extract_annual_values(facts, "InterestExpense")
     interest_exp = float(abs(interest.iloc[-1])) if not interest.empty else 0.0
 
-    return total_debt, interest_exp
+    return {
+        "total_debt": total_debt,
+        "interest_exp": interest_exp,
+        "breakdown": breakdown,          # {tag: latest_value} for each tag that had data
+    }
 
 
 # ─── Valuation engine ─────────────────────────────────────────────────────────
@@ -514,7 +567,9 @@ def screen_ticker(ticker: str, terminal_growth: float = TERMINAL_GROWTH_DEFAULT)
     shares = yinfo["shares"]
     cash = yinfo["cash"]
 
-    total_debt, interest_exp = get_debt_interest(facts)
+    debt_info = get_debt_interest(facts)
+    total_debt = debt_info["total_debt"]
+    interest_exp = debt_info["interest_exp"]
     net_debt = total_debt - cash
     if shares == 0:
         s = extract_annual_values(facts, "CommonStockSharesOutstanding", unit="shares")
@@ -561,6 +616,7 @@ def screen_ticker(ticker: str, terminal_growth: float = TERMINAL_GROWTH_DEFAULT)
         "total_debt": total_debt,
         "cash": cash,
         "net_debt": net_debt,
+        "debt_breakdown": debt_info["breakdown"],
         # FCF
         "fcf_series": fcf_series.tail(7),
         "fcf_growth_5yr": fcf_growth,
@@ -627,7 +683,19 @@ def print_ticker_detail(r: dict):
     t1.add_row("Current Price", f"[bold]${r['price']:.2f}[/bold]")
     t1.add_row("Market Cap", _fmt_b(r["market_cap"]))
     t1.add_row("Shares Outstanding", f"{r['shares']/1e9:.2f}B")
-    t1.add_row("Total Debt", _fmt_b(r["total_debt"]))
+    t1.add_row("Total Debt (expanded)", _fmt_b(r["total_debt"]))
+    # Show each EDGAR tag that contributed, indented under Total Debt.
+    _TAG_LABELS = {
+        "LongTermDebt":                       "  └ LTD (aggregate)",
+        "LongTermDebtNoncurrent":             "  └ LTD non-current",
+        "LongTermDebtCurrent":                "  └ LTD current mat.",
+        "ShortTermBorrowings":                "  └ Short-term borr.",
+        "OperatingLeaseLiabilityNoncurrent":  "  └ Op. lease (NC)",
+        "OperatingLeaseLiabilityCurrent":     "  └ Op. lease (C)",
+    }
+    for tag, val in r["debt_breakdown"].items():
+        label = _TAG_LABELS.get(tag, f"  └ {tag}")
+        t1.add_row(f"[dim]{label}[/dim]", f"[dim]{_fmt_b(val)}[/dim]")
     t1.add_row("Cash & Equivalents", _fmt_b(r["cash"]))
     t1.add_row("Net Debt (Debt − Cash)", _fmt_b(r["net_debt"]))
 

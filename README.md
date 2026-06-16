@@ -65,11 +65,23 @@ python dcf_screener.py --watchlist --min-upside 15
 
 3. **Beta** — raw historical beta (3-year weekly returns vs SPY) is blended with the Damodaran industry unlevered beta re-levered using the Hamada equation at the company's D/E ratio.
 
-4. **WACC** — cost of equity via CAPM (`Rf + β × ERP`), cost of debt from actual interest expense / total debt, weighted by market cap and debt.
+4. **Net Debt** — total financial debt is built from SEC EDGAR XBRL tags to capture all interest-bearing obligations:
 
-5. **DCF** — projects FCFF for 5 years, discounts to present value at WACC, then adds a Gordon Growth terminal value (`FCFF × (1+g) / (WACC − g)`).
+   | Tag | Role |
+   |-----|------|
+   | `LongTermDebtNoncurrent` | Bonds, term loans due after 12 months |
+   | `LongTermDebtCurrent` | Current maturities of long-term debt (only added when the non-current tag is present, to avoid double-counting with the aggregate `LongTermDebt` fallback) |
+   | `LongTermDebt` | Aggregate fallback for filers that don't split current / non-current |
+   | `ShortTermBorrowings` | Revolvers, commercial paper, short-term notes — never overlaps with LTD tags |
+   | `OperatingLeaseLiabilityNoncurrent/Current` | ASC 842 (effective FY2019) requires operating leases on-balance-sheet; they represent fixed obligations ranking alongside debt in distress (toggle via `INCLUDE_LEASE_LIABILITIES`) |
 
-6. **Intrinsic Value** — `(PV of FcFFs + PV of terminal value − net debt) / shares outstanding`. Subtracting net debt converts enterprise value (what WACC-discounted FCFF produces) to equity value.
+   `net_debt = total_debt − cash`. The terminal output shows which tags were found for each ticker.
+
+5. **WACC** — cost of equity via CAPM (`Rf + β × ERP`), pre-tax cost of debt from actual `InterestExpense / total_debt`, weighted by market cap and expanded total debt.
+
+6. **DCF** — projects FCFF for 5 years, discounts to present value at WACC, then adds a Gordon Growth terminal value (`FCFF × (1+g) / (WACC − g)`).
+
+7. **Intrinsic Value** — `(PV of FCFFs + PV of terminal value − net debt) / shares outstanding`. Subtracting net debt converts enterprise value (what WACC-discounted FCFF produces) to equity value.
 
 ## Model Assumptions
 
