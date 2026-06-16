@@ -177,6 +177,23 @@ def extract_annual_values(facts: dict, concept: str, unit: str = "USD") -> pd.Se
 
 
 def compute_fcf_series(facts: dict) -> pd.Series:
+    # Returns FCFF (Free Cash Flow to the Firm), not levered FCF.
+    #
+    # Why FCFF is required here:
+    #   US GAAP OCF is a *levered* figure — interest paid is already deducted
+    #   before the cash flow statement is prepared (IAS 7 / ASC 230).  Using
+    #   levered OCF as the numerator while discounting at WACC (an *unlevered*
+    #   rate) double-counts the interest tax shield: once implicitly inside OCF
+    #   and again through the lower WACC.  Subtracting net debt at the end then
+    #   adds a third inconsistency (bridge from enterprise → equity value is
+    #   only valid for unlevered cash flows).
+    #
+    # Correct FCFF formula:
+    #   FCFF = OCF + InterestExpense × (1 − T) − CapEx
+    #
+    # The add-back strips interest out of OCF (net of the tax shield we do want
+    # to keep), producing an unlevered operating cash flow.  WACC discounting
+    # + net-debt subtraction is then fully consistent.
     ocf_tags = [
         "NetCashProvidedByUsedInOperatingActivities",
         "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
@@ -203,7 +220,14 @@ def compute_fcf_series(facts: dict) -> pd.Series:
         return pd.Series(dtype=float)
 
     capex = capex.reindex(ocf.index).fillna(0).abs()
-    return ocf - capex
+
+    # Add back after-tax interest expense to convert levered OCF → unlevered FCFF.
+    # Years with no EDGAR interest data (e.g., zero-debt periods) default to 0,
+    # which is correct: no interest was paid, so no add-back is needed.
+    interest = extract_annual_values(facts, "InterestExpense")
+    interest_addback = interest.reindex(ocf.index).fillna(0).abs() * (1 - TAX_RATE)
+
+    return ocf - capex + interest_addback
 
 
 def five_year_fcf_growth(fcf: pd.Series) -> Optional[float]:
@@ -637,7 +661,7 @@ def print_ticker_detail(r: dict):
         f"[{cagr_color}][bold]{cagr*100:+.1f}%[/bold][/{cagr_color}]", "",
     )
 
-    console.print(Panel(t2, title="[bold]Free Cash Flow History (SEC EDGAR)[/bold]", border_style="cyan", padding=(0, 1)))
+    console.print(Panel(t2, title="[bold]FCFF History (SEC EDGAR)[/bold]", border_style="cyan", padding=(0, 1)))
 
     # ── Section 3: Cost of Capital ──
     t3 = Table(box=box.SIMPLE_HEAVY, show_header=False, padding=(0, 2))

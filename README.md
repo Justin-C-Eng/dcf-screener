@@ -55,17 +55,21 @@ python dcf_screener.py --watchlist --min-upside 15
 
 ## How It Works
 
-1. **FCF Series** — fetches `NetCashProvidedByUsedInOperatingActivities` and `PaymentsToAcquirePropertyPlantAndEquipment` from SEC EDGAR XBRL facts and computes annual FCF.
+1. **FCFF Series** — fetches `NetCashProvidedByUsedInOperatingActivities` and `PaymentsToAcquirePropertyPlantAndEquipment` from SEC EDGAR XBRL facts. US GAAP OCF is a **levered** cash flow (interest expense is already deducted), so using it directly with WACC (an unlevered discount rate) would double-count the interest tax shield. After-tax interest is therefore added back each year to produce **unlevered FCFF**:
 
-2. **FCF Growth Rate** — 5-year CAGR of historical FCF, capped at ±50%.
+   > `FCFF = OCF + InterestExpense × (1 − T) − CapEx`
+
+   This makes WACC discounting and the subsequent net-debt subtraction internally consistent.
+
+2. **FCFF Growth Rate** — 5-year CAGR of historical FCFF, capped at ±50%.
 
 3. **Beta** — raw historical beta (3-year weekly returns vs SPY) is blended with the Damodaran industry unlevered beta re-levered using the Hamada equation at the company's D/E ratio.
 
 4. **WACC** — cost of equity via CAPM (`Rf + β × ERP`), cost of debt from actual interest expense / total debt, weighted by market cap and debt.
 
-5. **DCF** — projects FCF for 5 years, discounts to present value, then adds a Gordon Growth terminal value (`FCF × (1+g) / (WACC − g)`).
+5. **DCF** — projects FCFF for 5 years, discounts to present value at WACC, then adds a Gordon Growth terminal value (`FCFF × (1+g) / (WACC − g)`).
 
-6. **Intrinsic Value** — `(PV of FCFs + PV of terminal value − net debt) / shares outstanding`.
+6. **Intrinsic Value** — `(PV of FcFFs + PV of terminal value − net debt) / shares outstanding`. Subtracting net debt converts enterprise value (what WACC-discounted FCFF produces) to equity value.
 
 ## Model Assumptions
 
