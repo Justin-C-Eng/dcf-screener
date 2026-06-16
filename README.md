@@ -1,11 +1,11 @@
 # DCF Undervalued Stock Screener
 
-A terminal-based stock screener that values equities using a Discounted Cash Flow (DCF) model. Pulls free cash flow data directly from SEC EDGAR 10-K filings, calculates WACC via CAPM with Bloomberg-style blended betas, and cross-validates intrinsic value against Yahoo Finance analyst price targets.
+A terminal-based stock screener that values equities using a Discounted Cash Flow (DCF) model. Pulls free cash flow data directly from SEC EDGAR 10-K filings, calculates WACC via CAPM with a fundamentals-based blended beta, and cross-validates intrinsic value against Yahoo Finance analyst price targets.
 
 ## Features
 
 - **SEC EDGAR integration** — pulls operating cash flow and CapEx from 10-K filings (no paid data feed required)
-- **Blended beta** — Bloomberg-style: ⅔ Damodaran industry unlevered beta (re-levered with Hamada equation) + ⅓ raw 3-year historical beta vs SPY
+- **Fundamental blended beta** — ⅔ Damodaran industry unlevered beta (re-levered via Hamada equation at the company's D/E ratio) + ⅓ raw 3-year historical beta vs `^SP500TR` (S&P 500 Total Return index). Non-US / ADR names trigger a country risk premium warning. *Note: Bloomberg Adjusted Beta uses the Blume mean-reversion formula (0.67 × β_raw + 0.33 × 1.0), which adjusts toward the market mean rather than an industry fundamental — this is a different methodology.*
 - **CAPM → WACC** — cost of equity via CAPM, after-tax cost of debt from actual interest expense, weighted by market cap and debt
 - **Gordon Growth DCF** — 5-year FCF projection using historical CAGR + perpetuity terminal value
 - **Cross-validation** — compares DCF intrinsic value against Yahoo Finance analyst consensus targets
@@ -63,7 +63,13 @@ python dcf_screener.py --watchlist --min-upside 15
 
 2. **FCFF Growth Rate** — 5-year CAGR of historical FCFF, capped at ±50%.
 
-3. **Beta** — raw historical beta (3-year weekly returns vs SPY) is blended with the Damodaran industry unlevered beta re-levered using the Hamada equation at the company's D/E ratio.
+3. **Beta** — raw historical beta is computed from 3-year weekly returns against `^SP500TR` (S&P 500 Total Return index; preferred over SPY because SPY's adjusted price lags true total return by ~20 bps/yr due to dividend timing and fees). This raw beta is blended with the Damodaran industry unlevered beta re-levered using the Hamada equation: `β_L = β_U × (1 + (1−T) × D/E)`.
+
+   > **Fundamental blended β = ⅔ × β_industry_relevered + ⅓ × β_raw**
+
+   The 2/3 weight on the industry figure reduces idiosyncratic noise and anchors the estimate toward a forward-looking sector norm. This differs from Bloomberg Adjusted Beta (Blume adjustment: `0.67 × β_raw + 0.33 × 1.0`), which regresses toward the market mean (1.0) rather than an industry fundamental.
+
+   For non-US / ADR names, a `country_risk_premium` can be passed to `cost_of_equity()` — Damodaran publishes annual CRP estimates by country.
 
 4. **Net Debt** — total financial debt is built from SEC EDGAR XBRL tags to capture all interest-bearing obligations:
 
@@ -92,7 +98,7 @@ python dcf_screener.py --watchlist --min-upside 15
 | Tax rate          | 21%     | US corporate tax rate              |
 | Projection years  | 5       | Explicit forecast horizon          |
 | Terminal growth   | 2.50%   | Long-run GDP growth approximation  |
-| Beta benchmark    | SPY     | S&P 500 ETF                        |
+| Beta benchmark    | ^SP500TR | S&P 500 Total Return index (dividends reinvested) |
 
 ## Disclaimer
 

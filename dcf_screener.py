@@ -37,7 +37,11 @@ HEADERS = {
 RISK_FREE_RATE = 0.043      # 10-year US Treasury yield
 MARKET_PREMIUM = 0.055      # Equity risk premium
 TAX_RATE = 0.21             # US corporate tax rate
-MARKET_TICKER = "SPY"       # Beta benchmark
+# ^SP500TR is the S&P 500 Total Return index (dividends reinvested).
+# Using it as the benchmark instead of SPY is more theoretically correct:
+# SPY's auto-adjusted price still lags the true total-return series by ~20 bps/yr
+# due to dividend timing and the ETF expense ratio, slightly understating beta.
+MARKET_TICKER = "^SP500TR"
 PROJECTION_YEARS = 5
 TERMINAL_GROWTH_DEFAULT = 0.025
 # ASC 842 (effective 2019) requires operating leases on-balance-sheet.
@@ -249,20 +253,23 @@ def five_year_fcf_growth(fcf: pd.Series) -> Optional[float]:
 
 # ─── Market data helpers ──────────────────────────────────────────────────────
 
-def get_beta(ticker: str, window_years: int = 3) -> float:
-    """Raw historical beta from weekly returns vs SPY."""
+def get_beta(ticker: str, window_years: int = 3, benchmark: str = MARKET_TICKER) -> float:
+    # Computes raw OLS beta: Cov(R_stock, R_benchmark) / Var(R_benchmark).
+    # Weekly frequency over 3 years: reduces microstructure noise vs daily while
+    # keeping enough observations (~156 weeks) for a stable covariance estimate.
+    # benchmark is parameterised so callers can substitute a local index for ADRs.
     try:
         end = datetime.today()
         start = end - timedelta(days=365 * window_years)
         prices = yf.download(
-            [ticker, MARKET_TICKER], start=start, end=end,
+            [ticker, benchmark], start=start, end=end,
             interval="1wk", progress=False, auto_adjust=True,
         )["Close"]
-        if prices.empty or ticker not in prices.columns:
+        if prices.empty or ticker not in prices.columns or benchmark not in prices.columns:
             return 1.0
         rets = prices.pct_change().dropna()
-        cov = rets[ticker].cov(rets[MARKET_TICKER])
-        var = rets[MARKET_TICKER].var()
+        cov = rets[ticker].cov(rets[benchmark])
+        var = rets[benchmark].var()
         return float(cov / var) if var != 0 else 1.0
     except Exception:
         return 1.0
@@ -352,13 +359,31 @@ def get_blended_beta(
     sector: str,
     industry: str,
     de_ratio: float,
+    country: str = "United States",
 ) -> dict:
-    """
-    Bloomberg-style blended beta: (2/3) × industry_relevered + (1/3) × raw_historical.
-    Falls back to raw beta if the Damodaran lookup fails.
-    Returns a dict with all intermediate values for display.
-    """
+    # Fundamental blended beta: (2/3) × industry re-levered + (1/3) × raw historical.
+    #
+    # Rationale for the weights:
+    #   The raw 3-year historical beta is noisy and backward-looking.  Weighting it
+    #   at 1/3 and anchoring 2/3 toward the Damodaran industry norm reduces
+    #   idiosyncratic noise and produces a more forward-looking estimate without
+    #   discarding firm-specific information entirely.
+    #
+    # This is NOT Bloomberg Adjusted Beta (Blume mean-reversion adjustment):
+    #   Bloomberg Adjusted β = 0.67 × β_raw + 0.33 × 1.0
+    #   Blume's formula regresses toward the market mean (1.0), not an industry
+    #   fundamental, and does not use balance-sheet re-levering.
+    #
+    # Falls back to raw beta if the Damodaran lookup fails.
+    # Returns a dict with all intermediate values for display.
     raw = get_beta(ticker)
+
+    if country and country not in ("United States", "N/A", ""):
+        console.print(
+            f"  [yellow]⚠ {ticker} is domiciled in {country}. "
+            f"Beta vs ^SP500TR may be noisy for non-US / ADR names. "
+            f"Consider a Country Risk Premium via cost_of_equity(country_risk_premium=...).[/yellow]"
+        )
 
     damod_df = fetch_damodaran_betas()
     if damod_df is None:
@@ -403,10 +428,12 @@ def get_yahoo_info(ticker: str) -> dict:
             "name": info.get("longName") or info.get("shortName") or ticker,
             "sector": info.get("sector", "N/A"),
             "industry": info.get("industry", "N/A"),
+            # country is used to warn when computing beta for non-US / ADR names
+            "country": info.get("country", "N/A"),
         }
     except Exception:
         return {"target": None, "market_cap": 0, "shares": 0, "cash": 0,
-                "name": ticker, "sector": "N/A", "industry": "N/A"}
+                "name": ticker, "sector": "N/A", "industry": "N/A", "country": "N/A"}
 
 
 def get_debt_interest(facts: dict, include_leases: bool = INCLUDE_LEASE_LIABILITIES) -> dict:
@@ -472,8 +499,14 @@ def get_debt_interest(facts: dict, include_leases: bool = INCLUDE_LEASE_LIABILIT
 
 # ─── Valuation engine ─────────────────────────────────────────────────────────
 
-def cost_of_equity(beta: float) -> float:
-    return RISK_FREE_RATE + beta * MARKET_PREMIUM
+def cost_of_equity(beta: float, country_risk_premium: float = 0.0) -> float:
+    # Extended CAPM: Ke = Rf + β × ERP + CRP
+    # CRP (Country Risk Premium) captures additional sovereign / political risk
+    # for companies with significant non-US revenue exposure.
+    # Damodaran publishes annual CRP estimates by country:
+    #   https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/ctryprem.html
+    # Default 0.0 is correct for US-domiciled companies with domestic operations.
+    return RISK_FREE_RATE + beta * MARKET_PREMIUM + country_risk_premium
 
 
 def calc_wacc(ke: float, kd_pre_tax: float, equity: float, debt: float) -> float:
@@ -578,9 +611,14 @@ def screen_ticker(ticker: str, terminal_growth: float = TERMINAL_GROWTH_DEFAULT)
     de_ratio = total_debt / mkt_cap if mkt_cap > 0 else 0.0
 
     console.print(f"  [dim]Calculating blended beta & cost of capital...[/dim]")
-    beta_info = get_blended_beta(ticker, yinfo["sector"], yinfo["industry"], de_ratio)
+    beta_info = get_blended_beta(
+        ticker, yinfo["sector"], yinfo["industry"], de_ratio,
+        country=yinfo["country"],
+    )
     blended_beta = beta_info["blended"]
-    ke = cost_of_equity(blended_beta)
+    # country_risk_premium=0.0 is the correct default for US companies.
+    # For non-US / ADR names, pass a Damodaran CRP to capture sovereign risk.
+    ke = cost_of_equity(blended_beta, country_risk_premium=0.0)
 
     kd_pretax = (interest_exp / total_debt) if total_debt > 1e6 else 0.05
     kd_pretax = float(np.clip(kd_pretax, 0.02, 0.15))
@@ -609,6 +647,7 @@ def screen_ticker(ticker: str, terminal_growth: float = TERMINAL_GROWTH_DEFAULT)
         "name": yinfo["name"],
         "sector": yinfo["sector"],
         "industry": yinfo["industry"],
+        "country": yinfo["country"],
         # market
         "price": price,
         "market_cap": mkt_cap,
@@ -739,7 +778,7 @@ def print_ticker_detail(r: dict):
     # Beta breakdown
     if r["beta_source"] == "blended":
         t3.add_row("[dim]── Beta Calculation ──[/dim]", "")
-        t3.add_row("Raw Historical β  (3yr weekly vs SPY)", f"{r['raw_beta']:.3f}")
+        t3.add_row("Raw Historical β  (3yr weekly vs ^SP500TR)", f"{r['raw_beta']:.3f}")
         t3.add_row(
             f"Damodaran Unlevered β  (industry avg)",
             f"{r['unlevered_beta']:.3f}",
@@ -749,12 +788,12 @@ def print_ticker_detail(r: dict):
             f"{r['industry_levered_beta']:.3f}",
         )
         t3.add_row(
-            "[bold]Blended β  (⅔ industry + ⅓ historical)[/bold]",
+            "[bold]Fundamental Blended β  (⅔ industry + ⅓ historical)[/bold]",
             f"[bold]{r['beta']:.3f}[/bold]",
         )
     else:
         t3.add_row("[dim]── Beta (Damodaran lookup failed — raw only) ──[/dim]", "")
-        t3.add_row("Raw Historical β  (3yr weekly vs SPY)", f"{r['raw_beta']:.3f}")
+        t3.add_row("Raw Historical β  (3yr weekly vs ^SP500TR)", f"{r['raw_beta']:.3f}")
         t3.add_row("[bold]Beta used[/bold]", f"[bold]{r['beta']:.3f}[/bold]")
 
     t3.add_row("─" * 38, "─" * 10)
@@ -770,7 +809,7 @@ def print_ticker_detail(r: dict):
     t3.add_row("─" * 38, "─" * 10)
     t3.add_row("[bold]WACC[/bold]", f"[bold yellow]{r['wacc']*100:.2f}%[/bold yellow]")
 
-    console.print(Panel(t3, title="[bold]Cost of Capital (Blended β → CAPM → WACC)[/bold]", border_style="yellow", padding=(0, 1)))
+    console.print(Panel(t3, title="[bold]Cost of Capital (Fundamental Blended β → CAPM → WACC)[/bold]", border_style="yellow", padding=(0, 1)))
 
     # ── Section 4: DCF Projection Table ──
     dcf = r["dcf"]
